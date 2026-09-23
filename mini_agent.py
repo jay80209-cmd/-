@@ -18,10 +18,12 @@ MAX_TOKENS = 128000  # model's output ceiling; you only pay for tokens actually 
 MAX_OUT = 8000  # chars of tool output sent back to the model (head + tail)
 ROOT = Path.cwd().resolve()
 AUTO_YES = "--yes" in sys.argv
+LOCAL = "--local" in sys.argv  # free mode: an open-source model on this computer, served by Ollama
+OLLAMA_URL = os.environ.get("MINI_AGENT_OLLAMA_URL", "http://localhost:11434")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 FALLBACK_MODELS = ("claude-opus-5", "claude-fable")  # models that take fallbacks="default"
 S = {  # settings changeable at runtime with slash commands
-    "model": os.environ.get("MINI_AGENT_MODEL", "claude-opus-5"),
+    "model": os.environ.get("MINI_AGENT_MODEL", "qwen3-coder" if LOCAL else "claude-opus-5"),
     "effort": os.environ.get("MINI_AGENT_EFFORT", "medium"),
     "think": False,
 }
@@ -29,7 +31,7 @@ HELP = """/new             start a new chat
 /resume          continue the last saved chat
 /attach <file>   attach an image, PDF or text file to your next message
 /memory          show what the assistant remembers about you
-/model <id>      switch model (Opus / Sonnet / Fable families)
+/model <id>      switch model (Claude: Opus / Sonnet / Fable; --local: any Ollama model)
 /effort <level>  low | medium | high | xhigh | max
 /think           show or hide thinking summaries
 Ctrl-C stops a reply, Ctrl-D quits."""
@@ -37,11 +39,37 @@ Ctrl-C stops a reply, Ctrl-D quits."""
 # Kept short and byte-stable so it caches; no timestamps or per-run values.
 BASE_SYSTEM = (
     "You are a helpful assistant and coding agent running in the user's terminal, in their project directory. "
-    "You can search and fetch the web, run shell commands, edit project files, and keep notes about the user "
+    f"You can {'' if LOCAL else 'search and fetch the web, '}run shell commands, edit project files, and keep notes about the user "
     "across chats with the memory tool (save lasting preferences and facts; never secrets). "
     "Be concise: no preamble, no restating the request, short final answers. "
     "Read only what you need (use view_range, grep, head) instead of whole large files."
 )
+
+
+# Local models don't know Anthropic's built-in tools, so they get the same tools with explicit schemas.
+LOCAL_TOOLS = [
+    {"name": "bash", "description": "Run a shell command in the project directory; returns stdout+stderr.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "editor",
+     "description": "View or edit project files. command=view (path; optional view_range [start, end]), "
+                    "create (path, file_text), str_replace (path, old_str, new_str; old_str must match once), "
+                    "insert (path, insert_line, insert_text).",
+     "input_schema": {"type": "object", "required": ["command", "path"], "properties": {
+         "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert"]},
+         "path": {"type": "string"}, "file_text": {"type": "string"}, "old_str": {"type": "string"},
+         "new_str": {"type": "string"}, "insert_line": {"type": "integer"}, "insert_text": {"type": "string"},
+         "view_range": {"type": "array", "items": {"type": "integer"}}}}},
+    {"name": "memory",
+     "description": "Long-term memory kept across chats as files under /memories. View it at the start of a task; "
+                    "save lasting user preferences. command=view (path), create (path, file_text), "
+                    "str_replace (path, old_str, new_str), insert (path, insert_line, insert_text), "
+                    "delete (path), rename (old_path, new_path).",
+     "input_schema": {"type": "object", "required": ["command"], "properties": {
+         "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert", "delete", "rename"]},
+         "path": {"type": "string"}, "file_text": {"type": "string"}, "old_str": {"type": "string"},
+         "new_str": {"type": "string"}, "insert_line": {"type": "integer"}, "insert_text": {"type": "string"},
+         "old_path": {"type": "string"}, "new_path": {"type": "string"}}}},
+]
 
 
 def load_system() -> str:
@@ -118,11 +146,15 @@ def run_tools(tool_uses: list, handlers: dict) -> list:
 
 def attachment_block(path: Path) -> dict:
     mime = mimetypes.guess_type(path.name)[0] or "text/plain"
+    if LOCAL and mime == "application/pdf":
+        raise ValueError("PDFs only work with Claude, not in --local mode")
     if mime in ("image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"):
         data = base64.standard_b64encode(path.read_bytes()).decode()
         kind = "document" if mime == "application/pdf" else "image"
         return {"type": kind, "source": {"type": "base64", "media_type": mime, "data": data}}
     text = path.read_text()
+    if LOCAL:  # Ollama has no document blocks
+        return {"type": "text", "text": f'<file name="{path.name}">\n{text}\n</file>'}
     return {"type": "document", "title": path.name, "source": {"type": "text", "media_type": "text/plain", "data": text}}
 
 
@@ -154,6 +186,15 @@ def show(event) -> None:
 
 
 def ask(client, system: str, tools: list, messages: list):
+    if LOCAL:  # Ollama supports the core Messages API only: no caching, compaction or betas
+        kwargs = {"model": S["model"], "max_tokens": MAX_TOKENS, "system": system, "tools": tools,
+                  "messages": messages, "output_config": {"effort": S["effort"]}}
+        if S["think"]:
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+        with client.messages.stream(**kwargs) as stream:
+            for event in stream:
+                show(event)
+            return stream.get_final_message()
     kwargs = {
         "model": S["model"],
         "max_tokens": MAX_TOKENS,
@@ -208,20 +249,24 @@ def run_turn(client, system: str, tools: list, handlers: dict, messages: list, u
 def main() -> None:
     CHATS.mkdir(parents=True, exist_ok=True)
     memory = BetaLocalFilesystemMemoryTool(base_path=str(HOME))
-    tools = [
+    tools = LOCAL_TOOLS if LOCAL else [
         {"type": "bash_20250124", "name": "bash"},
         {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool", "max_characters": MAX_OUT},
         memory.to_dict(),
         {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
         {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 5, "max_content_tokens": 20000},
     ]
-    handlers = {"bash": run_bash, "str_replace_based_edit_tool": run_editor, "memory": memory.call}
+    handlers = {"bash": run_bash, "str_replace_based_edit_tool": run_editor, "editor": run_editor,
+                "memory": memory.call}
     system = load_system()
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(base_url=OLLAMA_URL, api_key="ollama") if LOCAL else anthropic.Anthropic()
+    if not (client.api_key or client.auth_token or client.credentials):
+        sys.exit("No Claude API key: set ANTHROPIC_API_KEY, or run with --local to use a free local model.")
     messages, chat_file = load_last_chat() if "--resume" in sys.argv else ([], new_chat_file())
     attachments: list = []
     used = {"in": 0, "cached": 0, "out": 0}
-    print(f"mini_agent ({S['model']}, effort={S['effort']}) in {ROOT}. /help for commands, Ctrl-D to quit.")
+    mode = "local, free" if LOCAL else f"effort={S['effort']}"
+    print(f"mini_agent ({S['model']}, {mode}) in {ROOT}. /help for commands, Ctrl-D to quit.")
     while True:
         try:
             prompt = input("\n\033[1m> \033[0m").strip()
@@ -265,8 +310,9 @@ def main() -> None:
         checkpoint = len(messages)  # roll back here if the turn fails, so history stays valid
         try:
             content = [attachment_block(p) for p in attachments] + [{"type": "text", "text": prompt}]
-        except (OSError, UnicodeDecodeError) as e:
-            print(f"(can't read attachment: {e})")
+        except (OSError, ValueError) as e:
+            print(f"(can't read attachment: {e}; attachments cleared, please resend)")
+            attachments = []
             continue
         attachments = []
         messages.append({"role": "user", "content": content})

@@ -1,6 +1,6 @@
 # mini_agent
 
-一個很小、省 token 的終端機 AI 助手，參考 ChatGPT 和 Claude 的功能，約 280 行 Python，透過 Claude API 運作。
+一個很小、省 token 的終端機 AI 助手，參考 ChatGPT 和 Claude 的功能，約 340 行 Python。可以用 Claude API（付費、能力最強），也可以用自己電腦上的開源模型（免費）。
 
 ## 安裝與執行
 
@@ -12,6 +12,30 @@ python /path/to/mini_agent.py            # 每個 shell 指令執行前會先問
 python /path/to/mini_agent.py --yes      # 自動執行所有指令（小心使用）
 python /path/to/mini_agent.py --resume   # 接著上次的對話
 ```
+
+## 免費模式（--local）：用自己電腦上的開源模型
+
+不用 API 金鑰、不用付錢，模型直接在你的電腦上跑（透過 [Ollama](https://ollama.com/download)）。
+
+```bash
+# 1. 安裝 Ollama：https://ollama.com/download
+# 2. 下載模型（擇一，檔案約 14～19 GB，建議電腦有 16GB 以上記憶體，最好有顯示卡）
+ollama pull qwen3-coder     # 擅長寫程式
+ollama pull gpt-oss:20b     # 一般用途
+# 3. 把上下文加大一點再啟動（預設太小，長對話會忘記前面內容）
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+# 4. 另開一個終端機執行
+python /path/to/mini_agent.py --local
+MINI_AGENT_MODEL=gpt-oss:20b python /path/to/mini_agent.py --local   # 換模型
+```
+
+免費模式的限制：
+- 能力比 Claude 差很多，複雜的程式任務容易出錯。
+- 不能上網搜尋，不能讀 PDF（圖片和文字檔可以，但模型要支援看圖）。
+- 沒有自動壓縮，對話太長時用 `/new` 開新對話。
+- 速度取決於你的電腦。
+
+電腦比較弱的話，可以到 [ollama.com/search](https://ollama.com/search) 找標有「tools」、體積較小的模型。
 
 ## 功能
 
