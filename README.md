@@ -30,4 +30,6 @@ python /path/to/mini_agent.py --yes    # 自動執行所有指令（小心使用
 - `MINI_AGENT_MODEL`：預設 `claude-opus-5`
 - `MINI_AGENT_EFFORT`：`low` / `medium` / `high` / `xhigh` / `max`，預設 `medium`。想更省就設成 `low`。
 
+每次回答的上限設為模型最大值 128K token，並用串流接收，長回答不會逾時。上限只是天花板，只按實際用掉的 token 計費。
+
 另外開啟了 `fallbacks: "default"`：萬一請求被安全機制拒絕，伺服器會自動改用其他模型重試。

@@ -9,6 +9,7 @@ import anthropic
 
 MODEL = os.environ.get("MINI_AGENT_MODEL", "claude-opus-5")
 EFFORT = os.environ.get("MINI_AGENT_EFFORT", "medium")  # low | medium | high | xhigh | max
+MAX_TOKENS = 128000  # model's output ceiling; you only pay for tokens actually generated
 MAX_OUT = 8000  # chars of tool output sent back to the model (head + tail)
 ROOT = Path.cwd().resolve()
 AUTO_YES = "--yes" in sys.argv
@@ -112,9 +113,10 @@ def main() -> None:
         messages.append({"role": "user", "content": prompt})
         while True:
             try:
-                resp = client.beta.messages.create(
+                # Streaming keeps very long answers (up to MAX_TOKENS) from hitting HTTP timeouts.
+                with client.beta.messages.stream(
                     model=MODEL,
-                    max_tokens=16000,
+                    max_tokens=MAX_TOKENS,
                     system=SYSTEM,
                     tools=TOOLS,
                     messages=messages,
@@ -123,7 +125,11 @@ def main() -> None:
                     context_management={"edits": [{"type": "compact_20260112"}]},
                     fallbacks="default",
                     betas=BETAS,
-                )
+                ) as stream:
+                    for text in stream.text_stream:
+                        print(text, end="", flush=True)
+                    resp = stream.get_final_message()
+                print()
             except anthropic.APIStatusError as e:
                 print(f"API error {e.status_code}: {e.message}")
                 del messages[checkpoint:]
@@ -138,9 +144,6 @@ def main() -> None:
             used["out"] += u.output_tokens
             # Keep full content (incl. compaction blocks) so server-side compaction works.
             messages.append({"role": "assistant", "content": resp.content})
-            for block in resp.content:
-                if block.type == "text" and block.text.strip():
-                    print(block.text)
             if resp.stop_reason == "refusal":
                 print("(request declined)")
                 del messages[checkpoint:]
