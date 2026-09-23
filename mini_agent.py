@@ -1,31 +1,55 @@
 #!/usr/bin/env python3
-"""mini_agent: a small, token-frugal coding agent in the terminal (Claude API)."""
+"""mini_agent: a small, token-frugal AI assistant in the terminal (Claude API)."""
+import base64
+import json
+import mimetypes
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import anthropic
+from anthropic.tools.memory import BetaLocalFilesystemMemoryTool
 
-MODEL = os.environ.get("MINI_AGENT_MODEL", "claude-opus-5")
-EFFORT = os.environ.get("MINI_AGENT_EFFORT", "medium")  # low | medium | high | xhigh | max
+HOME = Path.home() / ".mini_agent"  # memories/, chats/, instructions.md
+CHATS = HOME / "chats"
 MAX_TOKENS = 128000  # model's output ceiling; you only pay for tokens actually generated
 MAX_OUT = 8000  # chars of tool output sent back to the model (head + tail)
 ROOT = Path.cwd().resolve()
 AUTO_YES = "--yes" in sys.argv
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+FALLBACK_MODELS = ("claude-opus-5", "claude-fable")  # models that take fallbacks="default"
+S = {  # settings changeable at runtime with slash commands
+    "model": os.environ.get("MINI_AGENT_MODEL", "claude-opus-5"),
+    "effort": os.environ.get("MINI_AGENT_EFFORT", "medium"),
+    "think": False,
+}
+HELP = """/new             start a new chat
+/resume          continue the last saved chat
+/attach <file>   attach an image, PDF or text file to your next message
+/memory          show what the assistant remembers about you
+/model <id>      switch model (Opus / Sonnet / Fable families)
+/effort <level>  low | medium | high | xhigh | max
+/think           show or hide thinking summaries
+Ctrl-C stops a reply, Ctrl-D quits."""
 
 # Kept short and byte-stable so it caches; no timestamps or per-run values.
-SYSTEM = (
-    "You are a coding agent working in the user's project directory. "
-    "Use the bash and editor tools to inspect and change files. "
+BASE_SYSTEM = (
+    "You are a helpful assistant and coding agent running in the user's terminal, in their project directory. "
+    "You can search and fetch the web, run shell commands, edit project files, and keep notes about the user "
+    "across chats with the memory tool (save lasting preferences and facts; never secrets). "
     "Be concise: no preamble, no restating the request, short final answers. "
     "Read only what you need (use view_range, grep, head) instead of whole large files."
 )
-TOOLS = [
-    {"type": "bash_20250124", "name": "bash"},
-    {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool", "max_characters": MAX_OUT},
-]
-BETAS = ["compact-2026-01-12", "server-side-fallback-2026-07-01"]
+
+
+def load_system() -> str:
+    parts = [BASE_SYSTEM]
+    for p in (HOME / "instructions.md", ROOT / "AGENTS.md", ROOT / "CLAUDE.md"):
+        if p.is_file():
+            parts.append(f'<instructions source="{p}">\n{p.read_text().strip()}\n</instructions>')
+    return "\n\n".join(parts)
 
 
 def clip(text: str) -> str:
@@ -81,85 +105,186 @@ def run_editor(inp: dict) -> str:
     raise ValueError(f"unknown command: {cmd}")
 
 
-HANDLERS = {"bash": run_bash, "str_replace_based_edit_tool": run_editor}
-
-
-def run_tools(content) -> list:
+def run_tools(tool_uses: list, handlers: dict) -> list:
     results = []
-    for block in content:
-        if block.type != "tool_use":
-            continue
+    for block in tool_uses:
         try:
-            out, err = HANDLERS[block.name](block.input), False
+            out, err = handlers[block.name](block.input), False
         except Exception as e:  # report every tool failure back so the model can recover
             out, err = f"Error: {e}", True
         results.append({"type": "tool_result", "tool_use_id": block.id, "content": out or "(empty)", "is_error": err})
     return results
 
 
+def attachment_block(path: Path) -> dict:
+    mime = mimetypes.guess_type(path.name)[0] or "text/plain"
+    if mime in ("image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"):
+        data = base64.standard_b64encode(path.read_bytes()).decode()
+        kind = "document" if mime == "application/pdf" else "image"
+        return {"type": kind, "source": {"type": "base64", "media_type": mime, "data": data}}
+    text = path.read_text()
+    return {"type": "document", "title": path.name, "source": {"type": "text", "media_type": "text/plain", "data": text}}
+
+
+def new_chat_file() -> Path:
+    return CHATS / f"{time.strftime('%Y%m%d-%H%M%S')}.json"
+
+
+def save_chat(path: Path, messages: list) -> None:
+    path.write_text(json.dumps(messages, ensure_ascii=False, default=lambda o: o.to_dict(mode="json")))
+
+
+def load_last_chat() -> tuple:
+    files = sorted(CHATS.glob("*.json"))
+    if not files:
+        print("(no saved chats)")
+        return [], new_chat_file()
+    print(f"(resumed {files[-1].name})")
+    return json.loads(files[-1].read_text()), files[-1]
+
+
+def show(event) -> None:
+    if event.type == "content_block_start" and event.content_block.type in ("tool_use", "server_tool_use"):
+        print(f"\033[2m[{event.content_block.name}]\033[0m", flush=True)
+    elif event.type == "content_block_delta":
+        if event.delta.type == "text_delta":
+            print(event.delta.text, end="", flush=True)
+        elif event.delta.type == "thinking_delta" and S["think"]:
+            print(f"\033[2m{event.delta.thinking}\033[0m", end="", flush=True)
+
+
+def ask(client, system: str, tools: list, messages: list):
+    kwargs = {
+        "model": S["model"],
+        "max_tokens": MAX_TOKENS,
+        "system": system,
+        "tools": tools,
+        "messages": messages,
+        "thinking": {"type": "adaptive", "display": "summarized" if S["think"] else "omitted"},
+        "output_config": {"effort": S["effort"]},
+        "cache_control": {"type": "ephemeral"},  # caches the whole prefix each turn
+        "context_management": {"edits": [{"type": "compact_20260112"}]},
+        "betas": ["compact-2026-01-12"],
+    }
+    if S["model"].startswith(FALLBACK_MODELS):
+        kwargs["fallbacks"] = "default"
+        kwargs["betas"].append("server-side-fallback-2026-07-01")
+    # Streaming keeps very long answers (up to MAX_TOKENS) from hitting HTTP timeouts.
+    with client.beta.messages.stream(**kwargs) as stream:
+        for event in stream:
+            show(event)
+        return stream.get_final_message()
+
+
+def run_turn(client, system: str, tools: list, handlers: dict, messages: list, used: dict) -> None:
+    pauses = 0
+    while True:
+        resp = ask(client, system, tools, messages)
+        print()
+        u = resp.usage
+        used["in"] += u.input_tokens + (u.cache_creation_input_tokens or 0)
+        used["cached"] += u.cache_read_input_tokens or 0
+        used["out"] += u.output_tokens
+        # Keep full content (incl. compaction blocks) so server-side compaction works.
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason == "refusal":
+            raise RuntimeError("request declined")
+        if resp.stop_reason == "pause_turn" and pauses < 5:  # long server-side web work; resume it
+            pauses += 1
+            continue
+        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        if resp.stop_reason == "max_tokens" and tool_uses:
+            # A cut-off tool call may carry partial input; ask for a smaller step instead of running it.
+            messages.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": b.id, "is_error": True,
+                 "content": "Error: output hit max_tokens; retry in smaller pieces."}
+                for b in tool_uses]})
+            continue
+        if resp.stop_reason != "tool_use":
+            return
+        messages.append({"role": "user", "content": run_tools(tool_uses, handlers)})
+
+
 def main() -> None:
+    CHATS.mkdir(parents=True, exist_ok=True)
+    memory = BetaLocalFilesystemMemoryTool(base_path=str(HOME))
+    tools = [
+        {"type": "bash_20250124", "name": "bash"},
+        {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool", "max_characters": MAX_OUT},
+        memory.to_dict(),
+        {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
+        {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 5, "max_content_tokens": 20000},
+    ]
+    handlers = {"bash": run_bash, "str_replace_based_edit_tool": run_editor, "memory": memory.call}
+    system = load_system()
     client = anthropic.Anthropic()
-    messages: list = []
+    messages, chat_file = load_last_chat() if "--resume" in sys.argv else ([], new_chat_file())
+    attachments: list = []
     used = {"in": 0, "cached": 0, "out": 0}
-    print(f"mini_agent ({MODEL}, effort={EFFORT}) in {ROOT}. Ctrl-D to quit.")
+    print(f"mini_agent ({S['model']}, effort={S['effort']}) in {ROOT}. /help for commands, Ctrl-D to quit.")
     while True:
         try:
             prompt = input("\n\033[1m> \033[0m").strip()
         except EOFError:
             break
+        except KeyboardInterrupt:
+            continue
         if not prompt:
             continue
+        if prompt.startswith("/"):
+            cmd, _, arg = prompt.partition(" ")
+            arg = arg.strip()
+            if cmd == "/help":
+                print(HELP)
+            elif cmd == "/new":
+                messages, chat_file, attachments = [], new_chat_file(), []
+                print("(new chat)")
+            elif cmd == "/resume":
+                messages, chat_file = load_last_chat()
+            elif cmd == "/attach":
+                path = Path(arg).expanduser()
+                if path.is_file():
+                    attachments.append(path)
+                    print(f"(attached {path.name}; it goes with your next message)")
+                else:
+                    print(f"(no such file: {arg})")
+            elif cmd == "/memory":
+                print(memory.call({"command": "view", "path": "/memories"}))
+            elif cmd == "/model" and arg:
+                S["model"] = arg
+                print(f"(model: {arg})")
+            elif cmd == "/effort" and arg in EFFORTS:
+                S["effort"] = arg
+                print(f"(effort: {arg})")
+            elif cmd == "/think":
+                S["think"] = not S["think"]
+                print(f"(thinking summaries {'on' if S['think'] else 'off'})")
+            else:
+                print(HELP)
+            continue
         checkpoint = len(messages)  # roll back here if the turn fails, so history stays valid
-        messages.append({"role": "user", "content": prompt})
-        while True:
-            try:
-                # Streaming keeps very long answers (up to MAX_TOKENS) from hitting HTTP timeouts.
-                with client.beta.messages.stream(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=SYSTEM,
-                    tools=TOOLS,
-                    messages=messages,
-                    output_config={"effort": EFFORT},
-                    cache_control={"type": "ephemeral"},  # caches the whole prefix each turn
-                    context_management={"edits": [{"type": "compact_20260112"}]},
-                    fallbacks="default",
-                    betas=BETAS,
-                ) as stream:
-                    for text in stream.text_stream:
-                        print(text, end="", flush=True)
-                    resp = stream.get_final_message()
-                print()
-            except anthropic.APIStatusError as e:
-                print(f"API error {e.status_code}: {e.message}")
-                del messages[checkpoint:]
-                break
-            except anthropic.APIConnectionError:
-                print("Network error; try again.")
-                del messages[checkpoint:]
-                break
-            u = resp.usage
-            used["in"] += u.input_tokens + (u.cache_creation_input_tokens or 0)
-            used["cached"] += u.cache_read_input_tokens or 0
-            used["out"] += u.output_tokens
-            # Keep full content (incl. compaction blocks) so server-side compaction works.
-            messages.append({"role": "assistant", "content": resp.content})
-            if resp.stop_reason == "refusal":
-                print("(request declined)")
-                del messages[checkpoint:]
-                break
-            if resp.stop_reason == "pause_turn":
-                continue
-            if resp.stop_reason == "max_tokens" and any(b.type == "tool_use" for b in resp.content):
-                # A cut-off tool call may carry partial input; ask for a smaller step instead of running it.
-                messages.append({"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": b.id, "is_error": True,
-                     "content": "Error: output hit max_tokens; retry in smaller pieces."}
-                    for b in resp.content if b.type == "tool_use"]})
-                continue
-            if resp.stop_reason != "tool_use":
-                break
-            messages.append({"role": "user", "content": run_tools(resp.content)})
+        try:
+            content = [attachment_block(p) for p in attachments] + [{"type": "text", "text": prompt}]
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"(can't read attachment: {e})")
+            continue
+        attachments = []
+        messages.append({"role": "user", "content": content})
+        try:
+            run_turn(client, system, tools, handlers, messages, used)
+            save_chat(chat_file, messages)
+        except KeyboardInterrupt:
+            print("\n(stopped)")
+            del messages[checkpoint:]
+        except anthropic.APIStatusError as e:
+            print(f"API error {e.status_code}: {e.message}")
+            del messages[checkpoint:]
+        except anthropic.APIConnectionError:
+            print("Network error; try again.")
+            del messages[checkpoint:]
+        except RuntimeError as e:
+            print(f"({e})")
+            del messages[checkpoint:]
         print(f"\033[2m[tokens: in {used['in']}, cache-read {used['cached']}, out {used['out']}]\033[0m")
 
 
